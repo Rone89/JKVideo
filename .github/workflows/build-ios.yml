@@ -48,4 +48,96 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/v}"
           PLIST=$(find ios -name "Info.plist" -path "*/JKVideo/*" | head -1)
           if [ -n "$PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $TAG" "$PLIST"
+            echo "✅ Set version to $TAG in $PLIST"
+          else
+            echo "⚠️ Info.plist not found, skipping version set"
+          fi
+
+      - name: Detect scheme name
+        id: scheme
+        run: |
+          # Try to find the scheme from workspace
+          if [ -d "ios/JKVideo.xcworkspace" ]; then
+            SCHEME=$(xcodebuild -workspace ios/JKVideo.xcworkspace -list 2>/dev/null | grep -A50 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+          fi
+          # Fallback: find any xcscheme file
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(find ios -name "*.xcscheme" -exec basename {} .xcscheme \; | head -1)
+          fi
+          # Fallback: use project name
+          if [ -z "$SCHEME" ]; then
+            SCHEME="JKVideo"
+          fi
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+          echo "🔍 Detected scheme: $SCHEME"
+
+      - name: Build (unsigned)
+        working-directory: ios
+        run: |
+          SCHEME="${{ steps.scheme.outputs.scheme }}"
+          echo "🔨 Building scheme: $SCHEME"
+
+          # Determine workspace or project
+          if [ -d "JKVideo.xcworkspace" ]; then
+            BUILD_TARGET="-workspace JKVideo.xcworkspace"
+          else
+            BUILD_TARGET="-project JKVideo.xcodeproj"
+          fi
+
+          xcodebuild \
+            $BUILD_TARGET \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            ENABLE_BITCODE=NO \
+            clean build 2>&1 | xcpretty
+
+      - name: Package IPA
+        run: |
+          echo "=== Searching for .app in ios/build ==="
+          find ios/build -type d -name "*.app" 2>/dev/null || echo "No .app found in ios/build"
+
+          # Broader search
+          APP_PATH=$(find . -path "*/Build/Products/*" -name "*.app" -type d | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ .app not found anywhere. Dumping build tree:"
+            find ios/build -type f -name "*.app" -o -type d -name "*.app" 2>/dev/null | head -20
+            find ios/build/Build/Products -type d 2>/dev/null | head -20
+            exit 1
+          fi
+
+          echo "✅ Found app: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          APP_NAME=$(basename "$APP_PATH" .app)
+          TAG="${GITHUB_REF#refs/tags/v}"
+          IPA_NAME="${APP_NAME}-${TAG:-unsigned}.ipa"
+          zip -r -y "$IPA_NAME" Payload/
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+          echo "✅ Built: $IPA_NAME ($(du -h "$IPA_NAME" | cut -f1))"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: '*.ipa'
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "JKVideo ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: '*.ipa'
+          draft: false
+          prerelease: false
